@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# sap_status_suse15_clustered_roles_ensa2.sh
+# Purpose: Detect SAP instance status on SUSE Linux Enterprise Server 15 with Pacemaker clusters
+# Adds ENSA2 resource name handling for ASCS/ERS clusters
+# Features:
+# - Detects clustered HANA (with SR roles), ENSA2 ASCS/ERS clusters
+# - Detects standalone HANA, ASCS, APP servers
+# - Suppresses bogus Unknown entries
+# Usage: ./sap_status_suse15_clustered_roles_ensa2.sh [--debug] [--owner]
+
+set -o pipefail
+DEBUG=0
+SHOW_OWNER=0
+for a in "$@"; do
+  case "$a" in
+    --debug) DEBUG=1 ;;
+    --owner) SHOW_OWNER=1 ;;
+  esac
+done
+
+dbg() { [[ $DEBUG -eq 1 ]] && printf "DEBUG: %s\n" "$*" >&2; }
+
+HOST=$(hostname -s)
+print_header() {
+  printf "%-15s %-6s %-4s %-8s %-10s %-12s" "Hostname" "SID" "Nr" "Type" "Running" "Role"
+  [[ $SHOW_OWNER -eq 1 ]] && printf " %-10s" "Owner"
+  printf "\n"
+}
+
+print_header
+
+# Detect Pacemaker cluster
+if systemctl is-active --quiet pacemaker; then
+  dbg "Pacemaker cluster detected"
+  crm_mon -r -1 | awk '/SAPInstance|SAPHana/{print}' | while read -r line; do
+    res_name=$(echo "$line" | awk '{print $1}')
+    state=$(echo "$line" | grep -o '(Started)' | sed 's/[()]//g')
+    ROLE="-"
+    SID="UNKNOWN"; INST="UNKNOWN"; NR="00"; TYPE="Unknown"
+
+    # Match ENSA2 ASCS/ERS resource names like SAPInstance_<SID>_ASCS<nr> or SAPInstance_<SID>_ERS<nr>
+    if [[ "$res_name" =~ SAPInstance_([A-Z0-9]+)_ASCS([0-9]+) ]]; then
+      SID="${BASH_REMATCH[1]}"
+      INST="ASCS${BASH_REMATCH[2]}"
+      NR="${BASH_REMATCH[2]}"
+      TYPE="ASCS"
+    elif [[ "$res_name" =~ SAPInstance_([A-Z0-9]+)_ERS([0-9]+) ]]; then
+      SID="${BASH_REMATCH[1]}"
+      INST="ERS${BASH_REMATCH[2]}"
+      NR="${BASH_REMATCH[2]}"
+      TYPE="ERS"
+    elif [[ "$res_name" =~ SAPInstance_([A-Z0-9]+)_([A-Z]+)([0-9]+) ]]; then
+      SID="${BASH_REMATCH[1]}"
+      INST="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+      NR="${BASH_REMATCH[3]}"
+      TYPE="${BASH_REMATCH[2]}"
+    elif [[ "$res_name" =~ SAPHana_([A-Z0-9]+) ]]; then
+      SID="${BASH_REMATCH[1]}"
+      INST="HDB"
+      NR="00"
+      TYPE="HANA"
+      ROLE=$(crm_mon -r -1 | awk -v sid=$SID '/SAPHanaController/ && $0 ~ sid {print}' | grep -o 'PRIMARY\|SECONDARY' | head -n1)
+      if [[ -z "$ROLE" ]]; then
+        ROLE=$(crm_mon -r -1 | awk -v sid=$SID '/SAPHanaController/ && $0 ~ sid {print}' | grep -o 'Master\|Slave' | head -n1)
+        [[ "$ROLE" == "Master" ]] && ROLE="PRIMARY"
+        [[ "$ROLE" == "Slave" ]] && ROLE="SECONDARY"
+      fi
+      [[ -z "$ROLE" ]] && ROLE="Unknown"
+    fi
+
+    OWNER="${SID,,}adm"
+    RUNNING="No"
+    [[ "$state" == "Started" ]] && RUNNING="Yes"
+
+    if [[ "$SID" != "UNKNOWN" ]]; then
+      printf "%-15s %-6s %-4s %-8s %-10s %-12s" "$HOST" "$SID" "$NR" "$TYPE" "$RUNNING" "$ROLE"
+      [[ $SHOW_OWNER -eq 1 ]] && printf " %-10s" "$OWNER"
+      printf "\n"
+    fi
+  done
+else
+  dbg "No cluster detected, fallback to sapservices"
+fi
+
+# Fallback: parse /usr/sap/sapservices
+if [[ -f /usr/sap/sapservices ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    PROFILE=$(echo "$line" | grep -o 'pf=[^ ]*' | sed 's/^pf=//')
+    SAP_EXE_DIR=$(echo "$line" | grep -o '/usr/sap/[^/ ]\+/[^/ ]\+/exe' | tail -n1)
+    SERVICE_NAME=$(echo "$line" | grep -o 'SAP[A-Za-z0-9_-]*')
+    if [[ -n "$PROFILE" ]]; then
+      SID=$(basename "$PROFILE" | cut -d_ -f1)
+      INST=$(basename "$PROFILE" | cut -d_ -f2)
+      NR=$(echo "$INST" | sed 's/[^0-9]*//g')
+      [[ -z "$NR" ]] && NR="00"
+      OWNER="${SID,,}adm"
+      TYPE="APP"
+      [[ "$INST" =~ ^ASCS ]] && TYPE="ASCS"
+      [[ "$INST" =~ ^ERS ]] && TYPE="ERS"
+      [[ "$INST" =~ ^HDB ]] && TYPE="HANA"
+      RUNNING="No"
+      ROLE="-"
+      if [[ -n "$SAP_EXE_DIR" ]]; then
+        SC_OUT=$(su - "$OWNER" -c "LD_LIBRARY_PATH=${SAP_EXE_DIR}:\$LD_LIBRARY_PATH ${SAP_EXE_DIR}/sapcontrol -nr ${NR} -function GetProcessList" 2>/dev/null)
+        [[ "$SC_OUT" =~ GREEN|Running ]] && RUNNING="Yes"
+      fi
+      if [[ "$RUNNING" == "No" ]]; then
+        if [[ -n "$SERVICE_NAME" && $(systemctl is-active "$SERVICE_NAME" 2>/dev/null) == "active" ]]; then
+          RUNNING="Yes"
+        elif ps -ef | grep -i sapstartsrv | grep -F -- "$PROFILE" >/dev/null 2>&1; then
+          RUNNING="Yes"
+        fi
+      fi
+      printf "%-15s %-6s %-4s %-8s %-10s %-12s" "$HOST" "$SID" "$NR" "$TYPE" "$RUNNING" "$ROLE"
+      [[ $SHOW_OWNER -eq 1 ]] && printf " %-10s" "$OWNER"
+      printf "\n"
+    fi
+  done < /usr/sap/sapservices
+fi
+
+# Profile scanning fallback with stricter checks
+for sid_dir in /usr/sap/*/*/exe; do
+  instdir=$(basename "$(dirname "$sid_dir")")
+  sid=$(basename "$(dirname "$(dirname "$sid_dir")")")
+  possible_profile="/usr/sap/${sid}/SYS/profile/${sid}_${instdir}_${HOST}"
+  [[ ! -f "$possible_profile" ]] && continue
+  SID=$sid; INST=$instdir; NR=$(echo "$INST" | sed 's/[^0-9]*//g'); [[ -z "$NR" ]] && NR="00"
+  OWNER="${SID,,}adm"
+  TYPE="APP"; [[ "$INST" =~ ^ASCS ]] && TYPE="ASCS"; [[ "$INST" =~ ^ERS ]] && TYPE="ERS"; [[ "$INST" =~ ^HDB ]] && TYPE="HANA"
+  [[ "$TYPE" == "Unknown" ]] && continue
+  RUNNING="No"
+  SC_OUT=$(su - "$OWNER" -c "LD_LIBRARY_PATH=${sid_dir}:\$LD_LIBRARY_PATH ${sid_dir}/sapcontrol -nr ${NR} -function GetProcessList" 2>/dev/null)
+  [[ "$SC_OUT" =~ GREEN|Running ]] && RUNNING="Yes"
+  if [[ "$RUNNING" == "No" && ps -ef | grep -i sapstartsrv | grep -F -- "$possible_profile" >/dev/null 2>&1 ]]; then
+    RUNNING="Yes"
+  fi
+  printf "%-15s %-6s %-4s %-8s %-10s %-12s" "$HOST" "$SID" "$NR" "$TYPE" "$RUNNING" "-"
+  [[ $SHOW_OWNER -eq 1 ]] && printf " %-10s" "$OWNER"
+  printf "\n"
+done
+
+exit 0
